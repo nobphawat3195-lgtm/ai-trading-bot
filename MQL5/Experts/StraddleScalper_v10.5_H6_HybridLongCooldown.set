@@ -1,0 +1,50 @@
+; H6 — Hybrid + Cooldown ยาว
+; สมมติฐาน: ADX กึ่งเข้ม (28) + reverse กลางๆ (3) + cooldown ยาวขึ้นมาก (15 นาที)
+;           แนวคิด: ถ้าโดน reverse ครบแล้วแสดงว่าช่วงนั้นน่าจะยัง sideway ซ่อนอยู่ (ADX อาจ lag)
+;           พักให้นานพอที่ตลาดจะคลี่ทิศทางใหม่ชัดเจนก่อนกลับมาเทรด
+; คาดหวัง: ความถี่เทรดต่ำกว่า baseline แต่ไม่เข้มเท่า H1 — ใช้เช็คว่า cooldown ยาวช่วยตัด loss-cluster ได้ไหม
+InpRiskPercent=1.0
+InpUseAutoLot=true
+InpMinLot=0.01
+InpMaxLot=0.5
+InpLotByBalanceStep=false
+InpBalancePerLot=1000.0
+InpStopDistance=220
+InpPendingExpiryMin=30
+InpRecenterPending=true
+InpRecenterTolerance=20
+InpUseReverse=true
+InpInitialSL=200
+InpTakeProfit=0
+InpReverseGap=50
+InpMaxReverses=3
+InpReverseCooldownM=15
+InpReverseTimeoutBars=3
+InpMaxPendingDistance=250
+InpBreakevenStart=50
+InpBreakevenLock=10
+InpTrailingStart=80
+InpTrailingDistance=80
+InpUseProgressiveTrail=true
+InpTrailRatio=0.6
+InpUseTimeFilter=true
+InpSession=2
+InpStartHour=14
+InpStartMinute=0
+InpEndHour=4
+InpEndMinute=0
+InpServerGMTOffset=3
+InpUseADXFilter=true
+InpADXTimeframe=15
+InpADXPeriod=14
+InpADXMinLevel=28.0
+InpMaxSpread=60
+InpUseRiskGuard=true
+InpMaxDailyLossPercent=10.0
+InpMaxDrawdownPercent=20.0
+InpPanelX=20
+InpPanelY=30
+InpDashboardExport=false
+InpDashboardFile=straddle_dashboard.json
+InpMagicNumber=769001
+InpComment=SS_H6
