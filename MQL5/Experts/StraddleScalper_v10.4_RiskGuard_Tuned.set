@@ -1,5 +1,5 @@
-; StraddleScalper_v10.4 — Risk Guard + Tuned Reverse (recommended)
-; Base: ค่าจาก ReportTester111.xlsx + ขยาย StopDistance/ReverseGap ลด noise whipsaw + เปิด Time Filter (London+NY)
+; StraddleScalper v10.5 — Risk Guard + Tuned Reverse + ADX/Time Filter (recommended)
+; v10.5: ตัด Zone Bounce ออก (ไม่ได้ใช้) + จัดกลุ่ม input ใหม่ให้อ่านง่าย
 ; โหลดไฟล์นี้ผ่าน Strategy Tester > Inputs tab > Load
 InpRiskPercent=1.0
 InpUseAutoLot=true
@@ -19,9 +19,6 @@ InpMaxReverses=4
 InpReverseCooldownM=5
 InpReverseTimeoutBars=3
 InpMaxPendingDistance=250
-InpUseRiskGuard=true
-InpMaxDailyLossPercent=10.0
-InpMaxDrawdownPercent=20.0
 InpBreakevenStart=50
 InpBreakevenLock=10
 InpTrailingStart=80
@@ -40,19 +37,12 @@ InpADXTimeframe=15
 InpADXPeriod=14
 InpADXMinLevel=25.0
 InpMaxSpread=60
+InpUseRiskGuard=true
+InpMaxDailyLossPercent=10.0
+InpMaxDrawdownPercent=20.0
 InpPanelX=20
 InpPanelY=30
 InpDashboardExport=false
 InpDashboardFile=straddle_dashboard.json
-InpUseZoneBounce=false
-InpZoneTimeframe=5
-InpZoneLookbackBars=300
-InpZoneBaseMaxBars=3
-InpZoneImpulseATRMult=1.0
-InpZoneATRPeriod=14
-InpZoneMaxActive=3
-InpZoneRescanBars=5
-InpZoneDrawRect=true
-InpZoneProximityPoints=130
 InpMagicNumber=769001
-InpComment=SS_v10.4
+InpComment=SS_v10.5
