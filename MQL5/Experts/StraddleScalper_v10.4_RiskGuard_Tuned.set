@@ -1,5 +1,5 @@
 ; StraddleScalper_v10.4 — Risk Guard + Tuned Reverse (recommended)
-; Base: ค่าจาก ReportTester111.xlsx (ล่าสุดที่รันผ่าน) + ปรับ InpMaxReverses/InpReverseCooldownM ตามคำแนะนำ
+; Base: ค่าจาก ReportTester111.xlsx + ขยาย StopDistance/ReverseGap ลด noise whipsaw + เปิด Time Filter (London+NY)
 ; โหลดไฟล์นี้ผ่าน Strategy Tester > Inputs tab > Load
 InpRiskPercent=1.0
 InpUseAutoLot=true
@@ -7,14 +7,14 @@ InpMinLot=0.01
 InpMaxLot=0.5
 InpLotByBalanceStep=false
 InpBalancePerLot=1000.0
-InpStopDistance=90
+InpStopDistance=220
 InpPendingExpiryMin=30
 InpRecenterPending=true
 InpRecenterTolerance=20
 InpUseReverse=true
 InpInitialSL=200
 InpTakeProfit=0
-InpReverseGap=20
+InpReverseGap=50
 InpMaxReverses=4
 InpReverseCooldownM=5
 InpReverseTimeoutBars=3
@@ -28,8 +28,8 @@ InpTrailingStart=80
 InpTrailingDistance=80
 InpUseProgressiveTrail=true
 InpTrailRatio=0.6
-InpUseTimeFilter=false
-InpSession=4
+InpUseTimeFilter=true
+InpSession=2
 InpStartHour=14
 InpStartMinute=0
 InpEndHour=4
