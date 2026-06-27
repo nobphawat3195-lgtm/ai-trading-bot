@@ -3,15 +3,17 @@
 //|  Based on: Volume-Weighted S/R Zones [WillyAlgoTrader] v1.4.3    |
 //|  Platform: MT5 | Symbol: XAUUSDm | TF: M15                       |
 //|  v1.01 — Fixed: Pivot detection, Zone init scan, Same-bar guard  |
+//|  v1.02 — Fixed: Spread-math thresholds now scale with LIVE       |
+//|          spread (were hardcoded to one broker's avg spread);     |
+//|          removed dead/incorrect PnL read in ManageOpenTrades     |
 //+------------------------------------------------------------------+
-//  SPREAD MATH CHECK (Exness ~308 pts):
-//    TP1 min  = 308 × 2.0  = 616 pts  → EA uses ATR-based TP ~1.0R ≥ 800 pts ✅
-//    SL min   = 308 × 1.5  = 462 pts  → EA uses Zone-aware SL  ≥ 600 pts ✅
-//    ATR M15  = ~1000-2000 pts         → >> Spread × 2.5 = 770  ✅
+//  SPREAD MATH CHECK (dynamic, scales with live SYMBOL_SPREAD):
+//    SL min   = spread × 1.5   → rejects entries with too-tight SL
+//    TP1 min  = spread × 2.0   → rejects entries with too-tight TP1
 //    Signal   = Zone Break + Volume    → 8-15 trades/day on M15  (quality > qty)
 //+------------------------------------------------------------------+
 #property copyright "VWSR EA — Based on WillyAlgoTrader Logic"
-#property version   "1.00"
+#property version   "1.02"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -673,13 +675,16 @@ void ExecuteEntry(ENUM_ORDER_TYPE orderType, double entryPrice, double atr, stri
 
    slDist = MathAbs(entryPrice - slPrice);
 
-   //--- Spread Math Validation — abort if SL or TP too tight
-   double spreadPts = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
-   double slPts     = slDist / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double tp1Pts    = slPts * InpTP1R;
-   if(slPts < 462 || tp1Pts < 616)
+   //--- Spread Math Validation — abort if SL or TP too tight relative to LIVE spread
+   double spreadPts  = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+   double slPts      = slDist / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   double tp1Pts     = slPts * InpTP1R;
+   double minSLPts   = spreadPts * 1.5;
+   double minTP1Pts  = spreadPts * 2.0;
+   if(slPts < minSLPts || tp1Pts < minTP1Pts)
    {
-      Print("SKIP: SL(", slPts, "pts) or TP1(", tp1Pts, "pts) below Spread Math minimum");
+      Print("SKIP: SL(", slPts, "pts) or TP1(", tp1Pts, "pts) below Spread Math minimum (",
+            minSLPts, "/", minTP1Pts, " for spread=", spreadPts, "pts)");
       return;
    }
 
@@ -740,10 +745,7 @@ void ManageOpenTrades()
    //--- Check if main position still open
    if(!g_pos.SelectByTicket(g_ticket1))
    {
-      //--- Position closed (hit SL or TP3)
-      double pnl = AccountInfoDouble(ACCOUNT_EQUITY) - AccountInfoDouble(ACCOUNT_BALANCE);
-      g_todayPnL += HistoryDealGetDouble(
-         HistoryDealGetInteger(0, DEAL_TICKET), DEAL_PROFIT);
+      //--- Position closed (hit SL or TP3); P&L already accumulated via OnTradeTransaction
       ResetTradeState();
       return;
    }
@@ -987,7 +989,7 @@ void UpdateDashboard(string status)
 
    string dash =
       "╔══════════════════════════════════════╗\n"
-      "║    VWSR Zone Breakout EA — v1.00     ║\n"
+      "║    VWSR Zone Breakout EA — v1.02     ║\n"
       "╠══════════════════════════════════════╣\n"
       "║ Symbol  : " + _Symbol + "  TF: M15\n"
       "║ Status  : " + status + "\n"
