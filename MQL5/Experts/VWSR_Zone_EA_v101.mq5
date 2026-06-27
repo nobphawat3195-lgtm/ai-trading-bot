@@ -6,14 +6,20 @@
 //|  v1.02 — Fixed: Spread-math thresholds now scale with LIVE       |
 //|          spread (were hardcoded to one broker's avg spread);     |
 //|          removed dead/incorrect PnL read in ManageOpenTrades     |
+//|  v1.03 — Multi-position mode: trades multiple zones concurrently |
+//|          under a total-portfolio-risk cap (InpMaxTotalRiskPct)   |
+//|          instead of "1 trade at a time" — for higher trade       |
+//|          frequency while keeping aggregate risk bounded. Added   |
+//|          per-slot TP1/BE/trailing management, entry cooldown,    |
+//|          and direction-exposure cap.                             |
 //+------------------------------------------------------------------+
 //  SPREAD MATH CHECK (dynamic, scales with live SYMBOL_SPREAD):
 //    SL min   = spread × 1.5   → rejects entries with too-tight SL
 //    TP1 min  = spread × 2.0   → rejects entries with too-tight TP1
-//    Signal   = Zone Break + Volume    → 8-15 trades/day on M15  (quality > qty)
+//    Signal   = Zone Break + Volume    → multiple trades/day on M15
 //+------------------------------------------------------------------+
 #property copyright "VWSR EA — Based on WillyAlgoTrader Logic"
-#property version   "1.02"
+#property version   "1.03"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -57,14 +63,18 @@ input int      InpMaxSpreadPts  = 500;       // Max Spread (pts) — skip if wid
 
 //--- Risk Management
 input group "=== Risk Management ==="
-input double   InpRiskPercent   = 1.0;       // Risk % per Trade (RISK_MEDIUM)
-input double   InpSLMultATR     = 1.5;       // SL Distance (×ATR) — fallback if no zone
-input double   InpTP1R          = 1.0;       // TP1 R-Multiple
-input double   InpTP2R          = 2.0;       // TP2 R-Multiple
-input double   InpTP3R          = 3.0;       // TP3 R-Multiple
-input bool     InpUseZoneSL     = true;      // Zone-Aware SL (SL behind broken zone)
-input double   InpMaxLot        = 0.10;      // Max Lot Size (hard cap)
-input double   InpMinLot        = 0.01;      // Min Lot Size
+input double   InpRiskPercent      = 1.0;    // Risk % per Trade (RISK_MEDIUM)
+input double   InpSLMultATR        = 1.5;    // SL Distance (×ATR) — fallback if no zone
+input double   InpTP1R             = 1.0;    // TP1 R-Multiple
+input double   InpTP2R             = 2.0;    // TP2 R-Multiple
+input double   InpTP3R             = 3.0;    // TP3 R-Multiple
+input bool     InpUseZoneSL        = true;   // Zone-Aware SL (SL behind broken zone)
+input double   InpMaxLot           = 0.10;   // Max Lot Size (hard cap, per position)
+input double   InpMinLot           = 0.01;   // Min Lot Size
+input int      InpMaxConcurrent    = 3;      // Max Concurrent Open Trades
+input double   InpMaxTotalRiskPct  = 3.0;    // Max TOTAL Risk Across All Open Trades (% balance)
+input int      InpMaxSameDirection = 2;      // Max Concurrent Trades in Same Direction
+input int      InpEntryCooldownBars= 1;      // Min Bars Between New Entries (any direction)
 
 //--- Trade Management
 input group "=== Trade Management ==="
@@ -85,6 +95,7 @@ input int      InpMaxTradesDay  = 20;        // Max Trades Per Day
 #define ZONE_RESISTANCE  1
 #define ZONE_SUPPORT    -1
 #define MAX_ZONES       20    // Array hard cap
+#define MAX_SLOTS       10    // Concurrent-trade slot hard cap
 
 struct ZoneData
 {
@@ -97,6 +108,21 @@ struct ZoneData
    bool     broken;       // Has price broken through?
    int      brokenBar;    // Bar index of break
    bool     mitigated;    // Already retested once?
+};
+
+//--- One open-trade slot (supports multiple concurrent trades)
+struct TradeSlot
+{
+   ulong    ticket;
+   bool     tp1Hit;
+   bool     tp2Hit;
+   double   entryPrice;
+   double   slPrice;
+   double   tp1Price;
+   double   tp2Price;
+   double   tp3Price;
+   int      dir;          // 1 long, -1 short
+   double   riskAmount;   // $ risk at entry (used for portfolio risk cap + daily R calc)
 };
 
 //===================================================================
@@ -121,18 +147,10 @@ int            g_lastBreakDir      = 0;  // 1 = bull break, -1 = bear break
 int            g_lastBreakBar      = 0;
 bool           g_lastBreakRetested = false;
 
-//--- Position tracking
-ulong          g_ticket1           = 0;   // Full position ticket
-ulong          g_ticket2           = 0;   // Second half (after partial TP)
-bool           g_tp1Hit            = false;
-bool           g_tp2Hit            = false;
-double         g_entryPrice        = 0;
-double         g_slPrice           = 0;
-double         g_tp1Price          = 0;
-double         g_tp2Price          = 0;
-double         g_tp3Price          = 0;
-int            g_tradeDir          = 0;   // 1 long, -1 short, 0 none
-double         g_riskAmount        = 0;   // $ risk for this trade
+//--- Multi-position trade slots
+TradeSlot      g_slots[MAX_SLOTS];
+int            g_slotCount         = 0;
+int            g_lastEntryBar      = -1000;   // bar index of most recent entry (cooldown)
 
 //--- Daily stats
 int            g_todayTrades       = 0;
@@ -165,11 +183,16 @@ int OnInit()
    //--- Initialize zone array
    ArrayInitialize_Zones();
 
+   //--- Initialize trade slots
+   g_slotCount = 0;
+
    //--- Reset daily counters
    ResetDailyStats();
 
-   Print("VWSR EA initialized. Magic=", InpMagicNumber,
-         " MaxLot=", InpMaxLot, " Risk=", InpRiskPercent, "%");
+   Print("VWSR EA v1.03 initialized. Magic=", InpMagicNumber,
+         " MaxLot=", InpMaxLot, " Risk=", InpRiskPercent, "%",
+         " MaxConcurrent=", InpMaxConcurrent,
+         " MaxTotalRiskPct=", InpMaxTotalRiskPct, "%");
    return INIT_SUCCEEDED;
 }
 
@@ -393,7 +416,6 @@ void RemoveZoneAt(int idx)
 }
 
 //===================================================================
-//===================================================================
 // SECTION 8: MAIN OnTick — BAR-BY-BAR LOGIC
 //===================================================================
 
@@ -451,13 +473,11 @@ void OnTick()
    //--- Step 2: Age decay and cleanup
    UpdateZoneDecay(totalBars);
 
-   //--- Step 3: Manage existing trades (TP / BE / Trailing)
+   //--- Step 3: Manage all open trade slots (TP / BE / Trailing)
    ManageOpenTrades();
 
-   //--- Step 4: Signal detection — only if no open trade
-   if(g_tradeDir != 0) { UpdateDashboard("TRADE ACTIVE"); return; }
-
-   //--- Check for break and retest signals
+   //--- Step 4: Signal detection — allowed even with trades open, as long as
+   //    under the concurrency + portfolio-risk caps (checked inside ExecuteEntry)
    bool sigBreakBull  = false;
    bool sigBreakBear  = false;
    bool sigRetestBull = false;
@@ -467,15 +487,15 @@ void OnTick()
    DetectRetests(sigRetestBull, sigRetestBear);
 
    // Debug: print zone count and signal status every bar
-   PrintFormat("BAR | Zones:%d  BreakBull:%s  BreakBear:%s  RetestBull:%s  RetestBear:%s  Spread:%.0f",
-      g_zoneCount,
+   PrintFormat("BAR | Zones:%d  Slots:%d/%d  BreakBull:%s  BreakBear:%s  RetestBull:%s  RetestBear:%s  Spread:%.0f",
+      g_zoneCount, g_slotCount, InpMaxConcurrent,
       sigBreakBull  ? "YES" : "no",
       sigBreakBear  ? "YES" : "no",
       sigRetestBull ? "YES" : "no",
       sigRetestBear ? "YES" : "no",
       SymbolInfoInteger(_Symbol, SYMBOL_SPREAD));
 
-   //--- Step 5: Execute entry
+   //--- Step 5: Execute entry (gated internally by concurrency/risk/cooldown caps)
    double closeBar1 = iClose(_Symbol, PERIOD_M15, 1); // Confirmed close (Shift 1)
    double atr       = GetATR(1);
 
@@ -608,16 +628,43 @@ void DetectRetests(bool &retestBull, bool &retestBear)
 }
 
 //===================================================================
-// SECTION 11: LOT SIZE CALCULATION
+// SECTION 11: LOT SIZE / RISK CALCULATION
 //===================================================================
 
-//--- Calculate lot size based on risk% and SL distance in price
-double CalcLotSize(double slDistPrice)
+//--- Sum of $ risk currently exposed across all open slots
+double GetTotalOpenRisk()
 {
+   double total = 0;
+   for(int i = 0; i < g_slotCount; i++)
+      total += g_slots[i].riskAmount;
+   return total;
+}
+
+//--- Count open slots in a given direction
+int CountSlotsInDirection(int dir)
+{
+   int n = 0;
+   for(int i = 0; i < g_slotCount; i++)
+      if(g_slots[i].dir == dir) n++;
+   return n;
+}
+
+//--- Calculate lot size based on risk% and SL distance in price.
+//    Also caps the trade so it never pushes TOTAL open risk above InpMaxTotalRiskPct.
+double CalcLotSize(double slDistPrice, double &outRiskAmount)
+{
+   outRiskAmount = 0;
    if(slDistPrice <= 0) return InpMinLot;
 
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskAmount = balance * InpRiskPercent / 100.0;
+   double balance     = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskAmount  = balance * InpRiskPercent / 100.0;
+
+   //--- Clamp this trade's risk so portfolio total stays under the cap
+   double maxTotalRisk = balance * InpMaxTotalRiskPct / 100.0;
+   double usedRisk      = GetTotalOpenRisk();
+   double remainingRisk = maxTotalRisk - usedRisk;
+   if(remainingRisk <= 0) return 0;          // no room left — caller must skip
+   riskAmount = MathMin(riskAmount, remainingRisk);
 
    double tickVal  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
@@ -631,9 +678,10 @@ double CalcLotSize(double slDistPrice)
    double lotMin   = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double lot      = MathFloor(lotRaw / lotStep) * lotStep;
    lot = MathMax(lot, lotMin);
-   lot = MathMin(lot, InpMaxLot);   // Hard cap 0.10
+   lot = MathMin(lot, InpMaxLot);   // Hard cap per position
 
-   g_riskAmount = riskAmount;
+   //--- Recompute actual $ risk for the rounded lot (for accurate portfolio tracking)
+   outRiskAmount = lot * slTicks * tickVal;
    return lot;
 }
 
@@ -646,7 +694,18 @@ void ExecuteEntry(ENUM_ORDER_TYPE orderType, double entryPrice, double atr, stri
    if(g_todayTrades >= InpMaxTradesDay) return;
    if(atr <= 0) return;
 
+   //--- Concurrency cap
+   if(g_slotCount >= MathMin(InpMaxConcurrent, MAX_SLOTS)) return;
+
+   //--- Entry cooldown (avoid stacking multiple entries on the same/adjacent bar)
+   int currentBars = iBars(_Symbol, PERIOD_M15);
+   if(currentBars - g_lastEntryBar < InpEntryCooldownBars) return;
+
    bool isBuy = (orderType == ORDER_TYPE_BUY);
+   int  dir   = isBuy ? 1 : -1;
+
+   //--- Same-direction exposure cap
+   if(CountSlotsInDirection(dir) >= InpMaxSameDirection) return;
 
    //--- Calculate SL using Zone-Aware method
    double slDist = atr * InpSLMultATR;
@@ -693,8 +752,14 @@ void ExecuteEntry(ENUM_ORDER_TYPE orderType, double entryPrice, double atr, stri
    double tp2 = isBuy ? entryPrice + slDist * InpTP2R : entryPrice - slDist * InpTP2R;
    double tp3 = isBuy ? entryPrice + slDist * InpTP3R : entryPrice - slDist * InpTP3R;
 
-   //--- Lot size
-   double lot = CalcLotSize(slDist);
+   //--- Lot size, clamped by remaining portfolio risk budget
+   double riskAmount = 0;
+   double lot = CalcLotSize(slDist, riskAmount);
+   if(lot <= 0)
+   {
+      Print("SKIP: No remaining portfolio risk budget (cap=", InpMaxTotalRiskPct, "%)");
+      return;
+   }
 
    //--- Normalize prices
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
@@ -716,114 +781,133 @@ void ExecuteEntry(ENUM_ORDER_TYPE orderType, double entryPrice, double atr, stri
       return;
    }
 
-   //--- Record trade state
-   g_ticket1    = g_trade.ResultOrder();
-   g_tp1Hit     = false;
-   g_tp2Hit     = false;
-   g_entryPrice = entryPrice;
-   g_slPrice    = slPrice;
-   g_tp1Price   = tp1;
-   g_tp2Price   = tp2;
-   g_tp3Price   = tp3;
-   g_tradeDir   = isBuy ? 1 : -1;
+   //--- Record new trade slot
+   int idx = g_slotCount;
+   g_slots[idx].ticket     = g_trade.ResultOrder();
+   g_slots[idx].tp1Hit     = false;
+   g_slots[idx].tp2Hit     = false;
+   g_slots[idx].entryPrice = entryPrice;
+   g_slots[idx].slPrice    = slPrice;
+   g_slots[idx].tp1Price   = tp1;
+   g_slots[idx].tp2Price   = tp2;
+   g_slots[idx].tp3Price   = tp3;
+   g_slots[idx].dir        = dir;
+   g_slots[idx].riskAmount = riskAmount;
+   g_slotCount++;
+
    g_todayTrades++;
+   g_lastEntryBar = currentBars;
 
    Print("ORDER OPEN | ", signalTag, " | Lot:", lot,
          " Entry:", entryPrice, " SL:", slPrice,
          " TP1:", tp1, " TP3:", tp3,
-         " SL-pts:", slPts, " Score:", g_lastBreakScore);
+         " SL-pts:", slPts, " Score:", g_lastBreakScore,
+         " Risk:$", riskAmount, " Slots:", g_slotCount, "/", InpMaxConcurrent);
 }
 
 //===================================================================
-// SECTION 13: TRADE MANAGEMENT (TP / BE / TRAILING)
+// SECTION 13: TRADE MANAGEMENT (TP / BE / TRAILING) — per slot
 //===================================================================
 
 void ManageOpenTrades()
 {
-   if(g_tradeDir == 0 || g_ticket1 == 0) return;
+   if(g_slotCount == 0) return;
 
-   //--- Check if main position still open
-   if(!g_pos.SelectByTicket(g_ticket1))
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double atr = GetATR(1);
+   int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   //--- Iterate backwards so RemoveSlotAt() during the loop is safe
+   for(int s = g_slotCount - 1; s >= 0; s--)
    {
-      //--- Position closed (hit SL or TP3); P&L already accumulated via OnTradeTransaction
-      ResetTradeState();
-      return;
-   }
+      ulong ticket = g_slots[s].ticket;
 
-   double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double curPrice= (g_tradeDir == 1) ? bid : ask;
-   double atr     = GetATR(1);
-   bool   isBuy   = (g_tradeDir == 1);
-
-   //--- TP1: Partial close 50% + move SL to Breakeven
-   if(!g_tp1Hit)
-   {
-      bool tp1Reached = isBuy ? (bid >= g_tp1Price) : (ask <= g_tp1Price);
-      if(tp1Reached)
+      //--- Check if this position is still open
+      if(!g_pos.SelectByTicket(ticket))
       {
-         g_tp1Hit = true;
-         //--- Partial close 50% of current volume
-         if(InpUsePartialTP)
+         //--- Position closed (hit SL or TP3); P&L already accumulated via OnTradeTransaction
+         RemoveSlotAt(s);
+         continue;
+      }
+
+      bool isBuy = (g_slots[s].dir == 1);
+
+      //--- TP1: Partial close 50% + move SL to Breakeven
+      if(!g_slots[s].tp1Hit)
+      {
+         bool tp1Reached = isBuy ? (bid >= g_slots[s].tp1Price) : (ask <= g_slots[s].tp1Price);
+         if(tp1Reached)
          {
-            double vol  = g_pos.Volume();
-            double half = NormalizeDouble(vol * 0.5,
-                          (int)MathLog10(1.0 / SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)));
-            if(half >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
-               g_trade.PositionClosePartial(g_ticket1, half);
+            g_slots[s].tp1Hit = true;
+            //--- Partial close 50% of current volume
+            if(InpUsePartialTP)
+            {
+               double vol  = g_pos.Volume();
+               double half = NormalizeDouble(vol * 0.5,
+                             (int)MathLog10(1.0 / SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)));
+               if(half >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
+                  g_trade.PositionClosePartial(ticket, half);
+            }
+            //--- Breakeven: move SL to entry
+            if(InpUseBreakEven)
+            {
+               double beSL = NormalizeDouble(g_slots[s].entryPrice, digits);
+               g_trade.PositionModify(ticket, beSL, g_slots[s].tp3Price);
+               g_slots[s].slPrice = beSL;
+               Print("BREAKEVEN ACTIVATED | Ticket:", ticket);
+            }
          }
-         //--- Breakeven: move SL to entry
-         if(InpUseBreakEven)
+      }
+
+      //--- TP2: Log only (position already halved; rest runs to TP3)
+      if(g_slots[s].tp1Hit && !g_slots[s].tp2Hit)
+      {
+         bool tp2Reached = isBuy ? (bid >= g_slots[s].tp2Price) : (ask <= g_slots[s].tp2Price);
+         if(tp2Reached)
          {
-            double beSL = NormalizeDouble(g_entryPrice,
-                          (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-            g_trade.PositionModify(g_ticket1, beSL, g_tp3Price);
-            g_slPrice = beSL;
-            Print("BREAKEVEN ACTIVATED | Ticket:", g_ticket1);
+            g_slots[s].tp2Hit = true;
+            Print("TP2 REACHED | Ticket:", ticket);
+         }
+      }
+
+      //--- Trailing stop after TP1 hit
+      if(g_slots[s].tp1Hit && InpUseTrailing && atr > 0 && g_pos.SelectByTicket(ticket))
+      {
+         double trailDist = atr * InpTrailATRMult;
+         double newSL;
+         if(isBuy)
+         {
+            newSL = NormalizeDouble(bid - trailDist, digits);
+            if(newSL > g_slots[s].slPrice + SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+            {
+               g_trade.PositionModify(ticket, newSL, g_slots[s].tp3Price);
+               g_slots[s].slPrice = newSL;
+            }
+         }
+         else
+         {
+            newSL = NormalizeDouble(ask + trailDist, digits);
+            if(newSL < g_slots[s].slPrice - SymbolInfoDouble(_Symbol, SYMBOL_POINT))
+            {
+               g_trade.PositionModify(ticket, newSL, g_slots[s].tp3Price);
+               g_slots[s].slPrice = newSL;
+            }
          }
       }
    }
 
-   //--- TP2: Log only (position already halved; rest runs to TP3)
-   if(g_tp1Hit && !g_tp2Hit)
-   {
-      bool tp2Reached = isBuy ? (bid >= g_tp2Price) : (ask <= g_tp2Price);
-      if(tp2Reached)
-      {
-         g_tp2Hit = true;
-         Print("TP2 REACHED | Ticket:", g_ticket1);
-      }
-   }
-
-   //--- Trailing stop after TP1 hit
-   if(g_tp1Hit && InpUseTrailing && atr > 0 && g_pos.SelectByTicket(g_ticket1))
-   {
-      double trailDist = atr * InpTrailATRMult;
-      double newSL;
-      if(isBuy)
-      {
-         newSL = NormalizeDouble(bid - trailDist,
-                 (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         if(newSL > g_slPrice + SymbolInfoDouble(_Symbol, SYMBOL_POINT))
-         {
-            g_trade.PositionModify(g_ticket1, newSL, g_tp3Price);
-            g_slPrice = newSL;
-         }
-      }
-      else
-      {
-         newSL = NormalizeDouble(ask + trailDist,
-                 (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS));
-         if(newSL < g_slPrice - SymbolInfoDouble(_Symbol, SYMBOL_POINT))
-         {
-            g_trade.PositionModify(g_ticket1, newSL, g_tp3Price);
-            g_slPrice = newSL;
-         }
-      }
-   }
-
-   //--- Basket close: check daily target
+   //--- Basket close: check daily target (closes ALL slots if hit)
    if(InpUseBasketClose) CheckBasketClose();
+}
+
+//--- Remove slot at index i, shift array left
+void RemoveSlotAt(int idx)
+{
+   if(idx < 0 || idx >= g_slotCount) return;
+   for(int i = idx; i < g_slotCount - 1; i++)
+      g_slots[i] = g_slots[i + 1];
+   g_slotCount--;
 }
 
 //===================================================================
@@ -853,7 +937,7 @@ void CloseAllPositions()
       if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
          g_trade.PositionClose(ticket);
    }
-   ResetTradeState();
+   g_slotCount = 0;
 }
 
 //--- Check if daily loss limit or trade count hit
@@ -901,23 +985,6 @@ void ResetDailyStats()
    g_lastDayReset  = TimeCurrent();
 }
 
-//--- Clear active trade tracking variables
-void ResetTradeState()
-{
-   g_ticket1    = 0;
-   g_ticket2    = 0;
-   g_tp1Hit     = false;
-   g_tp2Hit     = false;
-   g_entryPrice = 0;
-   g_slPrice    = 0;
-   g_tp1Price   = 0;
-   g_tp2Price   = 0;
-   g_tp3Price   = 0;
-   g_tradeDir   = 0;
-   g_riskAmount = 0;
-}
-
-//===================================================================
 //===================================================================
 // SECTION 15: ONTRADE TRANSACTION (Track closed trades for stats)
 //===================================================================
@@ -963,17 +1030,17 @@ void UpdateDashboard(string status)
    double atrPts   = atr / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
 
    string tradeInfo = "None";
-   if(g_tradeDir != 0)
+   if(g_slotCount > 0)
    {
-      string dir  = (g_tradeDir == 1) ? "LONG" : "SHORT";
-      string be   = g_tp1Hit ? " [BE]" : "";
-      string tp1s = g_tp1Hit ? "✓" : "—";
-      string tp2s = g_tp2Hit ? "✓" : "—";
-      tradeInfo   = dir + be +
-                    "  SL:" + DoubleToString(g_slPrice, 2) +
-                    "  TP1:" + tp1s + DoubleToString(g_tp1Price, 2) +
-                    "  TP2:" + tp2s + DoubleToString(g_tp2Price, 2) +
-                    "  TP3:" + DoubleToString(g_tp3Price, 2);
+      tradeInfo = "";
+      for(int i = 0; i < g_slotCount; i++)
+      {
+         string dir  = (g_slots[i].dir == 1) ? "LONG" : "SHORT";
+         string be   = g_slots[i].tp1Hit ? "[BE]" : "";
+         tradeInfo += dir + be + " SL:" + DoubleToString(g_slots[i].slPrice, 2) +
+                      " TP3:" + DoubleToString(g_slots[i].tp3Price, 2);
+         if(i < g_slotCount - 1) tradeInfo += "\n║            ";
+      }
    }
 
    //--- Count active zones by type
@@ -987,9 +1054,11 @@ void UpdateDashboard(string status)
       }
    }
 
+   double totalRisk = GetTotalOpenRisk();
+
    string dash =
       "╔══════════════════════════════════════╗\n"
-      "║    VWSR Zone Breakout EA — v1.02     ║\n"
+      "║    VWSR Zone Breakout EA — v1.03     ║\n"
       "╠══════════════════════════════════════╣\n"
       "║ Symbol  : " + _Symbol + "  TF: M15\n"
       "║ Status  : " + status + "\n"
@@ -1003,6 +1072,9 @@ void UpdateDashboard(string status)
                                g_lastBreakDir == -1 ? "BEAR ▼" : "—") +
                   "  Score: " + DoubleToString(g_lastBreakScore, 0) + "\n"
       "╠══════════════════════════════════════╣\n"
+      "║ Slots   : " + IntegerToString(g_slotCount) + "/" + IntegerToString(InpMaxConcurrent) +
+                  "   Open Risk: $" + DoubleToString(totalRisk, 2) +
+                  " (" + DoubleToString(InpMaxTotalRiskPct, 1) + "% cap)\n"
       "║ TRADE   : " + tradeInfo + "\n"
       "╠══════════════════════════════════════╣\n"
       "║ Today Trades : " + IntegerToString(g_todayTrades) + "/" +
@@ -1017,4 +1089,4 @@ void UpdateDashboard(string status)
 }
 
 //===================================================================
-// EOF — VWSR Zone Breakout EA v1.00
+// EOF — VWSR Zone Breakout EA v1.03
